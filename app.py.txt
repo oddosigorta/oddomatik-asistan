@@ -1,0 +1,111 @@
+import streamlit as st
+from langchain_community.document_loaders import PyPDFDirectoryLoader
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+import os
+import smtplib
+from email.mime.text import MIMEText
+
+# --- 1. AYARLAR VE MARKA KİMLİĞİ ---
+st.set_page_config(page_title="Oddomatik - Akıllı Sigorta Asistanı", page_icon="🤖")
+
+# --- 2. MAİL GÖNDERME SİSTEMİ (LEAD GENERATION) ---
+def mail_gonder(mesaj_icerigi):
+    try:
+        # BURAYI KENDİ BİLGİLERİNLE DOLDURMALISIN
+        gonderici = "asistan.oddomatik@gmail.com" 
+        alici = "teklif@oddomatik.com" # Tekliflerin düşeceği mail adresi
+        sifre = "xxxx xxxx xxxx xxxx" # Gmail'den alınacak 16 haneli uygulama şifresi
+        
+        msg = MIMEText(mesaj_icerigi)
+        msg['Subject'] = 'Oddomatik - Yeni Fiyat Talebi!'
+        msg['From'] = gonderici
+        msg['To'] = alici
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(gonderici, sifre)
+            server.send_message(msg)
+        return True
+    except:
+        return False
+
+# --- 3. API ANAHTARI (GÜVENLİ YÖNTEM) ---
+if "OPENAI_API_KEY" in st.secrets:
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+else:
+    st.error("Lütfen OpenAI API anahtarını Streamlit Secrets alanına ekleyin!")
+
+# --- 4. PDF VERİLERİNİ YÜKLEME ---
+@st.cache_resource
+def verileri_yukle():
+    if not os.path.exists("belgeler"):
+        os.makedirs("belgeler")
+    loader = PyPDFDirectoryLoader("belgeler/")
+    docs = loader.load()
+    if not docs:
+        return None
+    embeddings = OpenAIEmbeddings()
+    vectorstore = FAISS.from_documents(docs, embeddings)
+    return vectorstore
+
+# --- 5. ARAYÜZ TASARIMI ---
+st.title("🤖 Oddomatik")
+st.subheader("7/24 Akıllı Sigorta Danışmanınız")
+
+# Yan Menü (Sidebar)
+with st.sidebar:
+    st.image("https://via.placeholder.com/150?text=Oddomatik", width=150) # Logo yerine geçer
+    st.markdown("### Hızlı Teklif Al")
+    with st.form("iletisim"):
+        tel = st.text_input("Telefon Numaranız")
+        brans = st.selectbox("Branş", ["Kasko", "Sağlık", "Konut", "Diğer"])
+        gonder = st.form_submit_button("Sizi Arayalım")
+        if gonder and tel:
+            basari = mail_gonder(f"Oddomatik üzerinden talep geldi!\nTel: {tel}\nBranş: {brans}")
+            if basari: st.success("Talebiniz iletildi!")
+            else: st.warning("Şu an mail gönderilemedi, numaranızı chat'e yazabilirsiniz.")
+
+# --- 6. SOHBET MANTIĞI ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+if soru := st.chat_input("Oddomatik'e sorun..."):
+    st.session_state.messages.append({"role": "user", "content": soru})
+    with st.chat_message("user"):
+        st.markdown(soru)
+
+    # Fiyat/Teklif Kelime Kontrolü
+    fiyat_kelimeleri = ["fiyat", "teklif", "ne kadar", "kaç para", "hesapla"]
+    if any(k in soru.lower() for k in fiyat_kelimeleri):
+        cevap = "Oddomatik olarak size en uygun teklifi hazırlayabilmemiz için lütfen sol taraftaki formu doldurun veya telefon numaranızı buraya yazın."
+    else:
+        # PDF'den Bilgi Çekme (RAG)
+        db = verileri_yukle()
+        if db:
+            # Kesin Sadakat Promptu
+            sablon = """Sen Oddomatik adlı bir sigorta uzmanısın. Sadece sana verilen dökümanlara göre cevap ver. 
+            Bilgi yoksa uydurma, nazikçe bilmediğini söyle.
+            Dökümanlar: {context}
+            Soru: {question}
+            Cevap:"""
+            PROMPT = PromptTemplate(template=sablon, input_variables=["context", "question"])
+            
+            qa = RetrievalQA.from_chain_type(
+                llm=ChatOpenAI(model_name="gpt-4o", temperature=0),
+                retriever=db.as_retriever(),
+                chain_type_kwargs={"prompt": PROMPT}
+            )
+            result = qa.invoke(soru)
+            cevap = result["result"]
+        else:
+            cevap = "Henüz bilgi dökümanları yüklenmemiş. Lütfen 'belgeler' klasörüne PDF ekleyin."
+
+    with st.chat_message("assistant"):
+        st.markdown(cevap)
+    st.session_state.messages.append({"role": "assistant", "content": cevap})
